@@ -35,10 +35,9 @@ String K_LIKE_HOURLY = "likeHourly";
 String K_NOTIFY_GAP = "notifyGap";
 String K_LIKE_USERS = "likeUsers";
 String K_NOTIFY_USERS = "notifyUsers";
-String K_LIKE_TXT = "likeText";
-String K_NOTIFY_TXT = "notifyText";
 String K_LOG_HOURS = "logCleanHours";
 String K_LOG_CLEAN_AT = "logCleanAt";
+String K_NOTIFY_SEEN_INDEX = "notifySeenIndex";
 Object logFileLock = new Object();
 java.util.Timer logCleanTimer = null;
 
@@ -58,6 +57,12 @@ boolean apiReady = false;
 boolean apiProbed = false;
 long lastLikeAt = 0L;
 long lastNotifyAt = 0L;
+// 并发约定：limitLock 保护限流时间戳与计数；queueLock 保护点赞/通知队列；
+// seenLock 保护内存去重表；notifySeenLock 保护通知去重索引。
+Object limitLock = new Object();
+Object queueLock = new Object();
+Object seenLock = new Object();
+Object notifySeenLock = new Object();
 List likeTimes = new ArrayList();
 List notifyTimes = new ArrayList();
 List likeQueue = new ArrayList();
@@ -65,7 +70,16 @@ List notifyQueue = new ArrayList();
 int notifySuccessCount = 0;
 int notifyFailCount = 0;
 Map seenStatus = new HashMap();
-Map seenNotify = new HashMap();
+// notifyPending: 通知 key -> 已尝试次数；处理中/等待重试期间阻止重复入队。
+Map notifyPending = new HashMap();
+// notifyBackoff: 通知 key -> 放弃时间；短时间内反复发送失败后进入冷却，避免死循环重试。
+Map notifyBackoff = new HashMap();
+Map notifySeenMem = new HashMap();
+boolean notifySeenLoaded = false;
+int NOTIFY_SEEN_MAX = 300;
+long NOTIFY_SEEN_TTL = 48L * 3600000L;
+int NOTIFY_MAX_ATTEMPT = 3;
+long NOTIFY_FAIL_COOLDOWN = 1800000L;
 String lastErr = "";
 String TAG = "状态监控";
 Object plusHandle = null;
@@ -74,7 +88,6 @@ Object msgHandle = null;
 // 已解析的微信状态接口成员（避免动态变量，便于排查与复用）
 Method mSelectUser = null;
 Method mIsLiked = null;
-Method mDoLike = null;
 Map pendingLikes = java.util.Collections.synchronizedMap(new HashMap());
 boolean likeUnloaded = false;
 Object friendCacheLock = new Object();
@@ -99,6 +112,7 @@ void onLoad() {
         if (hostVerCode != 3200) log("注意：当前版本未经完整验证，请留意运行日志（已取证版本 8.0.79/3200）");
         if (!probeApi()) log("微信状态接口不可用，自动点赞与监控将保持关闭");
         registerMenus();
+        loadNotifySeen();
         preloadFriendCache();
         startLoop();
     } catch (Throwable t) {
@@ -151,9 +165,19 @@ Map getFriendCache() {
 
 void onUnload() {
     likeUnloaded = true;
+    running = false;
     pendingLikes.clear();
     if (logCleanTimer != null) { logCleanTimer.cancel(); logCleanTimer = null; }
-    running = false;
+    synchronized (queueLock) {
+        likeQueue.clear();
+        notifyQueue.clear();
+        jobScheduled = false;
+    }
+    synchronized (seenLock) {
+        seenStatus.clear();
+        notifyPending.clear();
+        notifyBackoff.clear();
+    }
     removeMenu(plusHandle);
     removeMenu(msgHandle);
     plusHandle = null;
@@ -247,15 +271,6 @@ int statusLikeState(String statusId) {
     }
 }
 
-boolean statusIsLiked(String statusId) {
-    return statusLikeState(statusId) == 1;
-}
-
-// 仅记录本插件通过微信原生点赞场景并经状态查询确认的结果。
-boolean networkLikeConfirmed(String wxid, String sid) {
-    return sid.equals(getString("networkLikeV136_" + wxid, ""));
-}
-
 // 直接复用当前版本微信自己的 NetSceneTextStatusLike，避免通用 JSON 发包
 // 将 protobuf 字段名误当作数字解析，也确保 BaseRequest、clientId 和字段类型
 // 与微信原生点赞路径一致。以下类名、构造器和 dispatcher 方法均已在当前 APK 取证。
@@ -304,8 +319,8 @@ void verifyNativeLike(final String wxid, final String sid, final String taskKey,
         int state = statusLikeState(sid);
         if (state == 1) {
             pendingLikes.remove(taskKey);
-            putString("networkLikeV136_" + wxid, sid);
-            lastLikeAt = System.currentTimeMillis();
+            // 点赞结果始终以微信 isLikeTextStatus 为准，不再为每个好友写一条
+            // networkLikeV136_* 持久化配置键，避免 config.prop 无限膨胀。
             log("微信原生点赞已确认: " + name(wxid) + " [" + sid + "]");
             return;
         }
@@ -359,20 +374,19 @@ void submitNetworkLike(final String wxid, final String sid) {
                 if (!submitted) {
                     pendingLikes.remove(taskKey);
                     // 只有提交失败才允许下一轮重新尝试；提交后结果未知时仍不自动重发。
-                    seenStatus.remove("L|" + wxid + "|" + sid);
+                    synchronized (seenLock) { seenStatus.remove("L|" + wxid + "|" + sid); }
                     log("微信原生点赞请求未提交: " + name(wxid) + " [" + sid + "] " + lastErr);
                     return;
                 }
-                likeTimes.add(Long.valueOf(System.currentTimeMillis()));
                 // 请求提交后必须以微信点赞状态查询确认，不能把 dispatcher 返回值当成成功。
-                lastLikeAt = System.currentTimeMillis();
+                // 限流时间戳和计数已在 reserveLikeSlot 中原子占位，这里不再重复累加。
                 log("微信原生点赞请求已提交，等待状态确认: " + name(wxid) + " [" + sid + "]");
                 delay(8000L, new Runnable() {
                     public void run() { verifyNativeLike(wxid, sid, taskKey, 1); }
                 });
             } catch (Throwable t) {
                 pendingLikes.remove(taskKey);
-                seenStatus.remove("L|" + wxid + "|" + sid);
+                synchronized (seenLock) { seenStatus.remove("L|" + wxid + "|" + sid); }
                 lastErr = String.valueOf(t);
                 log("点赞请求异常: " + name(wxid) + " [" + sid + "] " + t);
             }
@@ -389,11 +403,6 @@ void startLoop() {
     scheduleNext();
 }
 
-void stopLoop() {
-    running = false;
-    log("已停止状态监控轮询");
-}
-
 void scheduleNext() {
     if (!running) return;
     int sec = getInt(K_INTERVAL, 300);
@@ -406,7 +415,13 @@ void scheduleNext() {
     });
 }
 
+// 卸载后旧的 delay 回调仍会到期，必须在这里拦截，否则可能继续读状态甚至点赞。
+boolean loopAlive() {
+    return running && !likeUnloaded;
+}
+
 void safeTick() {
+    if (!loopAlive()) return;
     if (ticking) return;
     ticking = true;
     try {
@@ -419,34 +434,39 @@ void safeTick() {
 }
 
 void sweep() {
+    if (!loopAlive()) return;
     if (!probeApi()) return;
     boolean likeOn = getBoolean(K_LIKE_ON, true);
     boolean notifyOn = getBoolean(K_NOTIFY_ON, true);
-    List ids = new ArrayList();
-    ids.addAll(getList(K_LIKE_USERS));
-    ids.addAll(getList(K_NOTIFY_USERS));
+    // 名单每轮只读一次快照，避免每个好友都重新解析配置里的 stringSet。
+    Set likeSet = new HashSet(getList(K_LIKE_USERS));
+    Set notifySet = new HashSet(getList(K_NOTIFY_USERS));
     Set uniq = new LinkedHashSet();
-    uniq.addAll(ids);
+    uniq.addAll(likeSet);
+    uniq.addAll(notifySet);
     long now = System.currentTimeMillis();
     int n = 0;
     for (Object o : uniq) {
-        String wxid = String.valueOf(o);
+        if (!loopAlive()) return;
+        String wxid = cleanWxid(o);
         if (wxid == null || wxid.length() == 0 || "null".equals(wxid)) continue;
         try {
-            handleFriend(wxid, likeOn, notifyOn, now);
+            handleFriend(wxid, likeOn, notifyOn, now, likeSet.contains(wxid), notifySet.contains(wxid));
             n++;
         } catch (Throwable t) {
             log("处理 " + wxid + " 异常: " + t);
         }
     }
-    cleanup(seenStatus, now, 48L * 3600000L);
-    cleanup(seenNotify, now, 48L * 3600000L);
+    synchronized (seenLock) {
+        cleanup(seenStatus, now, 48L * 3600000L);
+        cleanup(notifyBackoff, now, NOTIFY_FAIL_COOLDOWN);
+    }
     if (n > 0) log("本轮检查 " + n + " 个好友");
 }
 
-void handleFriend(String wxid, boolean likeOn, boolean notifyOn, long now) {
-    boolean wantLike = likeOn && inList(true, wxid);
-    boolean wantNotify = notifyOn && inList(false, wxid);
+void handleFriend(String wxid, boolean likeOn, boolean notifyOn, long now, boolean inLike, boolean inNotify) {
+    boolean wantLike = likeOn && inLike;
+    boolean wantNotify = notifyOn && inNotify;
     if (!wantLike && !wantNotify) return;
     Map st = statusGet(wxid);
     if (st == null) return;
@@ -454,36 +474,137 @@ void handleFriend(String wxid, boolean likeOn, boolean notifyOn, long now) {
     if (sid == null || sid.length() == 0 || "null".equals(sid)) return;
     if (wantLike) {
         String key = "L|" + wxid + "|" + sid;
-        if (!seenStatus.containsKey(key)) {
+        boolean known;
+        synchronized (seenLock) { known = seenStatus.containsKey(key); }
+        if (!known) {
             int likedState = statusLikeState(sid);
             if (likedState == 1) {
-                seenStatus.put(key, Long.valueOf(now));
+                synchronized (seenLock) { seenStatus.put(key, Long.valueOf(now)); }
                 log("查询确认已经点赞，跳过: " + name(wxid) + " [" + sid + "]");
             } else if (likedState == 0) {
-                seenStatus.put(key, Long.valueOf(now));
+                synchronized (seenLock) { seenStatus.put(key, Long.valueOf(now)); }
                 scheduleLike(wxid, sid, key);
             } else {
                 log("无法确认是否已点赞，暂不发送: " + name(wxid) + " [" + sid + "] " + lastErr);
             }
         }
     }
-    if (wantNotify) {
-        String key2 = "N|" + wxid + "|" + sid;
-        if (!notifySeenPersisted(wxid, sid, now) && !seenNotify.containsKey(key2)) {
-            seenNotify.put(key2, Long.valueOf(now));
-            putLong(notifySeenKey(wxid, sid), now);
-            scheduleNotify(wxid, st);
+    // 通知去重不再预先落盘：只有 doNotify 真正发出通知后才写入索引。
+    if (wantNotify && claimNotify(wxid, sid, now)) scheduleNotify(wxid, sid, 0L);
+}
+
+// ================= 通知去重：内存索引 + 单条持久化键 =================
+// 旧实现在每个新状态上写一条 notifySeenV155_<wxid>_<sid>，只判过期从不删除，
+// 配置会随好友和状态数量无限膨胀。现在合并为一条索引，写入前按时效和条数裁剪。
+String notifySeenKeyOf(String wxid, String sid) { return wxid + "|" + sid; }
+
+void loadNotifySeen() {
+    if (notifySeenLoaded) return;
+    synchronized (notifySeenLock) {
+        if (notifySeenLoaded) return;
+        Map loaded = new HashMap();
+        int dropped = 0;
+        try {
+            String raw = getString(K_NOTIFY_SEEN_INDEX, "");
+            long now = System.currentTimeMillis();
+            if (raw != null && raw.length() > 0) {
+                String[] parts = raw.split(";");
+                for (int i = 0; i < parts.length; i++) {
+                    String s = parts[i].trim();
+                    if (s.length() == 0) continue;
+                    int sep = s.lastIndexOf('~');
+                    if (sep <= 0 || sep >= s.length() - 1) { dropped++; continue; }
+                    try {
+                        long ts = Long.parseLong(s.substring(sep + 1).trim());
+                        if (ts > 0L && now - ts >= 0L && now - ts < NOTIFY_SEEN_TTL) {
+                            loaded.put(s.substring(0, sep), Long.valueOf(ts));
+                        } else {
+                            dropped++;
+                        }
+                    } catch (Throwable ignoreParse) { dropped++; }
+                }
+            }
+        } catch (Throwable t) {
+            log("读取通知去重索引失败，将重新建立: " + t);
+        }
+        notifySeenMem = loaded;
+        notifySeenLoaded = true;
+        log("通知去重索引已载入 " + loaded.size() + " 条" + (dropped > 0 ? "，丢弃过期或无效 " + dropped + " 条" : ""));
+    }
+}
+
+boolean notifySeenCached(String wxid, String sid, long now) {
+    loadNotifySeen();
+    synchronized (notifySeenLock) {
+        Object v = notifySeenMem.get(notifySeenKeyOf(wxid, sid));
+        if (!(v instanceof Long)) return false;
+        long ts = ((Long) v).longValue();
+        return ts > 0L && now - ts >= 0L && now - ts < NOTIFY_SEEN_TTL;
+    }
+}
+
+// 只有通知真正发出后才写入，发送失败不落盘，交给 doNotify 回退重试。
+void markNotifySeen(String wxid, String sid, long now) {
+    loadNotifySeen();
+    synchronized (notifySeenLock) {
+        notifySeenMem.put(notifySeenKeyOf(wxid, sid), Long.valueOf(now));
+        try {
+            List ks = new ArrayList();
+            List vs = new ArrayList();
+            for (Object o : notifySeenMem.keySet()) {
+                Object v = notifySeenMem.get(o);
+                if (!(v instanceof Long)) continue;
+                long ts = ((Long) v).longValue();
+                if (ts <= 0L || now - ts < 0L || now - ts >= NOTIFY_SEEN_TTL) continue;
+                ks.add(String.valueOf(o));
+                vs.add(Long.valueOf(ts));
+            }
+            // 规模有上限（最多 NOTIFY_SEEN_MAX 条），用插入排序按时间从新到旧排列。
+            for (int i = 1; i < vs.size(); i++) {
+                long tv = ((Long) vs.get(i)).longValue();
+                String tk = String.valueOf(ks.get(i));
+                int j = i - 1;
+                while (j >= 0 && ((Long) vs.get(j)).longValue() < tv) {
+                    vs.set(j + 1, vs.get(j));
+                    ks.set(j + 1, ks.get(j));
+                    j--;
+                }
+                vs.set(j + 1, Long.valueOf(tv));
+                ks.set(j + 1, tk);
+            }
+            int limit = vs.size() > NOTIFY_SEEN_MAX ? NOTIFY_SEEN_MAX : vs.size();
+            StringBuffer sb = new StringBuffer();
+            Map kept = new HashMap();
+            for (int i = 0; i < limit; i++) {
+                if (sb.length() > 0) sb.append(";");
+                sb.append(String.valueOf(ks.get(i))).append("~").append(((Long) vs.get(i)).longValue());
+                kept.put(String.valueOf(ks.get(i)), vs.get(i));
+            }
+            // 内存索引与配置文件保持同一上限，避免长期运行时无限增长。
+            notifySeenMem = kept;
+            putString(K_NOTIFY_SEEN_INDEX, sb.toString());
+        } catch (Throwable t) {
+            log("保存通知去重索引失败: " + t);
         }
     }
 }
 
-String notifySeenKey(String wxid, String sid) {
-    return "notifySeenV155_" + wxid + "_" + sid;
+// 认领一个待通知任务：已成功通知过、正在处理中或处于失败冷却期时都不再入队。
+boolean claimNotify(String wxid, String sid, long now) {
+    if (sid == null || sid.length() == 0) return false;
+    if (notifySeenCached(wxid, sid, now)) return false;
+    String k = notifySeenKeyOf(wxid, sid);
+    synchronized (seenLock) {
+        if (notifyPending.containsKey(k)) return false;
+        Object back = notifyBackoff.get(k);
+        if (back instanceof Long && now - ((Long) back).longValue() < NOTIFY_FAIL_COOLDOWN) return false;
+        notifyPending.put(k, Integer.valueOf(1));
+    }
+    return true;
 }
 
-boolean notifySeenPersisted(String wxid, String sid, long now) {
-    long seenAt = getLong(notifySeenKey(wxid, sid), 0L);
-    return seenAt > 0L && now - seenAt < 48L * 3600000L;
+void releaseNotify(String k) {
+    synchronized (seenLock) { notifyPending.remove(k); }
 }
 
 void scheduleLike(String wxid, String sid, String key) {
@@ -498,68 +619,85 @@ void scheduleLike(String wxid, String sid, String key) {
     job.put("sid", sid);
     job.put("key", key);
     job.put("at", Long.valueOf(System.currentTimeMillis() + wait));
-    likeQueue.add(job);
+    synchronized (queueLock) { likeQueue.add(job); }
     log("计划点赞 " + name(wxid) + "，随机延时 " + (wait / 1000) + " 秒");
     ensureJobRunner();
 }
 
-void scheduleNotify(String wxid, Map st) {
+void scheduleNotify(String wxid, String sid, long waitMs) {
     Map job = new HashMap();
     job.put("wxid", wxid);
-    job.put("st", st);
-    job.put("at", Long.valueOf(System.currentTimeMillis()));
-    notifyQueue.add(job);
+    job.put("sid", sid);
+    job.put("at", Long.valueOf(System.currentTimeMillis() + waitMs));
+    synchronized (queueLock) { notifyQueue.add(job); }
     ensureJobRunner();
 }
 
 void ensureJobRunner() {
-    if (jobScheduled) return;
-    jobScheduled = true;
+    synchronized (queueLock) {
+        if (jobScheduled || !running || likeUnloaded) return;
+        jobScheduled = true;
+    }
     delay(1000L, new Runnable() {
         public void run() {
-            jobScheduled = false;
+            synchronized (queueLock) { jobScheduled = false; }
+            if (!loopAlive()) return;
             try { runJobs(); } catch (Throwable t) { log("任务执行异常: " + t); }
         }
     });
 }
 
 void runJobs() {
+    if (!loopAlive()) return;
     long now = System.currentTimeMillis();
-    if (!likeQueue.isEmpty()) {
-        List dueLikes = new ArrayList(likeQueue);
-        likeQueue = new ArrayList();
-        for (Object o : dueLikes) {
+    List dueLikes = new ArrayList();
+    List remainLikes = new ArrayList();
+    List dueNotify = new ArrayList();
+    List remainNotify = new ArrayList();
+    synchronized (queueLock) {
+        for (Object o : likeQueue) {
             Map j = (Map) o;
             long at = ((Long) j.get("at")).longValue();
-            if (at <= now) {
-                doLike(String.valueOf(j.get("wxid")), String.valueOf(j.get("sid")), String.valueOf(j.get("key")));
-            } else {
-                likeQueue.add(j);
-            }
+            if (at <= now) dueLikes.add(j); else remainLikes.add(j);
         }
-    }
-    if (!notifyQueue.isEmpty()) {
-        List remain2 = new ArrayList();
-        for (Object o : new ArrayList(notifyQueue)) {
+        likeQueue = remainLikes;
+        for (Object o : notifyQueue) {
             Map j = (Map) o;
             long at = ((Long) j.get("at")).longValue();
-            if (at <= now) {
-                doNotify(String.valueOf(j.get("wxid")), (Map) j.get("st"));
-            } else {
-                remain2.add(j);
-            }
+            if (at <= now) dueNotify.add(j); else remainNotify.add(j);
         }
-        notifyQueue = remain2;
+        notifyQueue = remainNotify;
     }
-    if (!likeQueue.isEmpty() || !notifyQueue.isEmpty()) ensureJobRunner();
+    for (Object o : dueLikes) {
+        if (!loopAlive()) return;
+        Map j = (Map) o;
+        try {
+            doLike(String.valueOf(j.get("wxid")), String.valueOf(j.get("sid")), String.valueOf(j.get("key")));
+        } catch (Throwable t) {
+            log("点赞任务异常: " + t);
+        }
+    }
+    for (Object o : dueNotify) {
+        if (!loopAlive()) return;
+        Map j = (Map) o;
+        try {
+            doNotify(String.valueOf(j.get("wxid")), String.valueOf(j.get("sid")));
+        } catch (Throwable t) {
+            log("通知任务异常: " + t);
+        }
+    }
+    boolean pending;
+    synchronized (queueLock) { pending = !likeQueue.isEmpty() || !notifyQueue.isEmpty(); }
+    if (pending) ensureJobRunner();
 }
 
 void doLike(String wxid, String sid, String key) {
     try {
         if (!getBoolean(K_LIKE_ON, true)) return;
         if (!inList(true, wxid)) { log("点赞名单已变更，取消: " + name(wxid)); return; }
-        if (!allow("like")) {
-            requeue(likeQueue, wxid, sid, 60000L);
+        // 限流必须在这里原子占位，否则同一轮多个到期任务会全部通过检查再并发提交。
+        if (!reserveLikeSlot()) {
+            requeue(wxid, sid, 60000L);
             log("点赞限流中，稍后重试: " + name(wxid));
             return;
         }
@@ -569,56 +707,86 @@ void doLike(String wxid, String sid, String key) {
     }
 }
 
-void requeue(List queue, String wxid, String sid, long delayMs) {
+void requeue(String wxid, String sid, long delayMs) {
     Map job = new HashMap();
     job.put("wxid", wxid);
     job.put("sid", sid);
     job.put("key", "R|" + wxid + "|" + sid);
     job.put("at", Long.valueOf(System.currentTimeMillis() + delayMs));
-    queue.add(job);
+    synchronized (queueLock) { likeQueue.add(job); }
     ensureJobRunner();
 }
 
-void doNotify(String wxid, Map st) {
+// 通知失败不落盘去重标记：退避后重试，最多 NOTIFY_MAX_ATTEMPT 次。
+void doNotify(String wxid, String sid) {
+    String k = notifySeenKeyOf(wxid, sid);
+    int attempt = 0;
+    synchronized (seenLock) {
+        Object v = notifyPending.get(k);
+        if (v instanceof Integer) attempt = ((Integer) v).intValue();
+    }
     try {
-        if (!getBoolean(K_NOTIFY_ON, true)) return;
-        if (!inList(false, wxid)) return;
-        if (!allow("notify")) {
-            Map job = new HashMap();
-            job.put("wxid", wxid);
-            job.put("st", st);
-            job.put("at", Long.valueOf(System.currentTimeMillis() + 30000L));
-            notifyQueue.add(job);
-            ensureJobRunner();
+        if (!loopAlive() || !getBoolean(K_NOTIFY_ON, true)) { releaseNotify(k); return; }
+        if (!inList(false, wxid)) { releaseNotify(k); return; }
+        if (!reserveNotifySlot()) {
+            synchronized (seenLock) { notifyPending.put(k, Integer.valueOf(attempt)); }
+            scheduleNotify(wxid, sid, 30000L);
             return;
         }
         long t = System.currentTimeMillis();
-        lastNotifyAt = t;
-        notifyTimes.add(Long.valueOf(t));
         String msg = "好友 " + name(wxid) + " 发布了新微信状态";
-        log("通知: " + msg + " [" + st.get("statusId") + "]");
-        if (showNotice("微信状态提醒", msg)) notifySuccessCount++;
-        else notifyFailCount++;
+        boolean sent = showNotice("微信状态提醒", msg);
+        if (sent) {
+            notifySuccessCount++;
+            log("通知: " + msg + " [" + sid + "]");
+            releaseNotify(k);
+            synchronized (seenLock) { notifyBackoff.remove(k); }
+            markNotifySeen(wxid, sid, t);
+            return;
+        }
+        notifyFailCount++;
+        if (attempt >= NOTIFY_MAX_ATTEMPT) {
+            releaseNotify(k);
+            synchronized (seenLock) { notifyBackoff.put(k, Long.valueOf(t)); }
+            log("通知多次失败，本状态在此后 " + (NOTIFY_FAIL_COOLDOWN / 60000L) + " 分钟内不再提醒: " + name(wxid) + " [" + sid + "]");
+            return;
+        }
+        synchronized (seenLock) { notifyPending.put(k, Integer.valueOf(attempt + 1)); }
+        scheduleNotify(wxid, sid, 60000L);
+        log("通知未发出，第 " + (attempt + 1) + " 次重试已排期: " + name(wxid) + " [" + sid + "]");
     } catch (Throwable e) {
         notifyFailCount++;
+        releaseNotify(k);
         log("通知异常: " + e);
     }
 }
 
-boolean allow(String kind) {
-    long now = System.currentTimeMillis();
-    if ("like".equals(kind)) {
+// 检查通过时立刻在同一个同步块内占用时间戳和计数，避免同一轮并发绕过限流。
+boolean reserveLikeSlot() {
+    synchronized (limitLock) {
+        long now = System.currentTimeMillis();
         long gap = (long) getInt(K_LIKE_GAP, 30) * 1000L;
         if (gap > 0 && now - lastLikeAt < gap) return false;
         prune(likeTimes, now, 3600000L);
         int cap = getInt(K_LIKE_HOURLY, 20);
         if (cap > 0 && likeTimes.size() >= cap) return false;
+        lastLikeAt = now;
+        likeTimes.add(Long.valueOf(now));
         return true;
     }
-    long gap2 = (long) getInt(K_NOTIFY_GAP, 5) * 1000L;
-    if (gap2 > 0 && now - lastNotifyAt < gap2) return false;
-    prune(notifyTimes, now, 60000L);
-    return notifyTimes.size() < 10;
+}
+
+boolean reserveNotifySlot() {
+    synchronized (limitLock) {
+        long now = System.currentTimeMillis();
+        long gap = (long) getInt(K_NOTIFY_GAP, 5) * 1000L;
+        if (gap > 0 && now - lastNotifyAt < gap) return false;
+        prune(notifyTimes, now, 60000L);
+        if (notifyTimes.size() >= 10) return false;
+        lastNotifyAt = now;
+        notifyTimes.add(Long.valueOf(now));
+        return true;
+    }
 }
 
 void prune(List list, long now, long windowMs) {
@@ -676,7 +844,6 @@ boolean isForeground() {
 // ================= 名单管理 =================
 String listName(boolean like) { return like ? "点赞名单" : "通知名单"; }
 String attrKey(boolean like) { return like ? K_LIKE_USERS : K_NOTIFY_USERS; }
-String textKey(boolean like) { return like ? K_LIKE_TXT : K_NOTIFY_TXT; }
 
 List getList(String key) {
     try {
@@ -695,64 +862,19 @@ boolean inList(boolean like, String wxid) {
     return l.contains(wxid);
 }
 
-void addTo(boolean like, String wxid) {
-    if (wxid == null) return;
-    wxid = wxid.trim();
-    if (wxid.length() == 0) return;
-    List l = getList(attrKey(like));
-    if (!l.contains(wxid)) {
-        l.add(wxid);
-        putStringSet(attrKey(like), new LinkedHashSet(l));
-        log("加入" + listName(like) + "：" + wxid);
-    }
-    String txt = getString(textKey(like), "");
-    if (txt.indexOf(wxid) < 0) {
-        if (txt.length() > 0 && !txt.endsWith("\n")) txt = txt + "\n";
-        txt = txt + wxid;
-        putString(textKey(like), txt);
-    }
-    resetSeen();
-}
-
-void removeFrom(boolean like, String wxid) {
-    if (wxid == null) return;
-    List l = getList(attrKey(like));
-    l.remove(wxid);
-    putStringSet(attrKey(like), new LinkedHashSet(l));
-    String txt = getString(textKey(like), "");
-    List keep = new ArrayList();
-    String[] parts = txt.split("\n");
-    for (int i = 0; i < parts.length; i++) {
-        String ln = parts[i].trim();
-        if (ln.length() == 0) continue;
-        if (ln.equals(wxid)) continue;
-        if (ln.endsWith(wxid)) continue;
-        keep.add(ln);
-    }
-    putString(textKey(like), joinLines(keep));
-    log("移出" + listName(like) + "：" + wxid);
-    resetSeen();
-}
-
 void clearList(boolean like) {
     putStringSet(attrKey(like), new LinkedHashSet());
-    putString(textKey(like), "");
     log("已清空" + listName(like));
     resetSeen();
 }
 
+// 名单变更后清空内存去重，让新加入的好友可以在下一轮立刻被检查。
 void resetSeen() {
-    seenStatus = new HashMap();
-    seenNotify = new HashMap();
-}
-
-String joinLines(List l) {
-    StringBuffer sb = new StringBuffer();
-    for (Object o : l) {
-        if (sb.length() > 0) sb.append("\n");
-        sb.append(String.valueOf(o));
+    synchronized (seenLock) {
+        seenStatus.clear();
+        notifyPending.clear();
+        notifyBackoff.clear();
     }
-    return sb.toString();
 }
 
 String listSummary(boolean like) {
@@ -802,7 +924,6 @@ void showFriendList(final boolean like) {
                             }
                         }
                         putStringSet(attrKey(like), keep);
-                        putString(textKey(like), joinLines(new ArrayList(keep)));
                         resetSeen();
                         toast("已保存" + listName(like) + "，当前共 " + keep.size() + " 人");
                     }
@@ -1271,7 +1392,6 @@ void applyFriendSelection(boolean like, boolean add, List wxids, Set selectedInd
         }
     }
     putStringSet(attrKey(like), target);
-    putString(textKey(like), joinLines(new ArrayList(target)));
     resetSeen();
     log((add ? "同步" : "批量移出") + listName(like) + "：变更 " + changed + " 人");
     toast((add ? "名单已同步，变更 " : "已移除 ") + changed + " 人，当前共 " + target.size() + " 人");
@@ -1320,7 +1440,6 @@ void applyLabelSelection(boolean like, List wxids, Set selectedIndexes) {
     }
 
     putStringSet(attrKey(like), target);
-    putString(textKey(like), joinLines(new ArrayList(target)));
     resetSeen();
     log("按标签同步" + listName(like) + "：添加 " + added + " 人，移除 " + removed + " 人");
     toast("已添加 " + added + " 人，取消 " + removed + " 人；当前共 " + target.size() + " 人");
